@@ -7978,3 +7978,373 @@ input[type="radio"], input[type="checkbox"] { accent-color: #1D4ED8 !important; 
 """, unsafe_allow_html=True)
 except Exception:
     pass
+
+
+
+
+
+
+
+
+elif view == "Daily Business":
+    import pandas as pd, numpy as np, altair as alt
+    from datetime import date, timedelta
+
+    st.subheader("Daily Business — Time & Mix Explorer (MTD / Cohort)")
+
+    # ---------------------------
+    # Resolve columns defensively
+    # ---------------------------
+    def _pick(df, preferred, cands):
+        if preferred and preferred in df.columns: return preferred
+        for c in cands:
+            if c in df.columns: return c
+        return None
+
+    _create = _pick(df_f, globals().get("create_col"),
+                    ["Create Date","Created Date","Deal Create Date","CreateDate","Created On"])
+    _pay    = _pick(df_f, globals().get("pay_col"),
+                    ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
+    _first  = _pick(df_f, globals().get("first_cal_sched_col"),
+                    ["First Calibration Scheduled Date","First Calibration","First Cal Scheduled"])
+    _resch  = _pick(df_f, globals().get("cal_resched_col"),
+                    ["Calibration Rescheduled Date","Cal Rescheduled","Rescheduled Date"])
+    _done   = _pick(df_f, globals().get("cal_done_col"),
+                    ["Calibration Done Date","Cal Done Date","Calibration Completed"])
+
+    _cns    = _pick(df_f, globals().get("counsellor_col"),
+                    ["Academic Counsellor","Counsellor","Advisor"])
+    _cty    = _pick(df_f, globals().get("country_col"),
+                    ["Country","Student Country","Deal Country"])
+    _src    = _pick(df_f, globals().get("source_col"),
+                    ["JetLearn Deal Source","Deal Source","Source","Lead Source"])
+
+    if not _create or not _pay:
+        st.warning("This tab needs 'Create Date' and 'Payment Received Date' columns mapped.", icon="⚠️")
+        st.stop()
+
+    # ---------------------------
+    # Controls
+    # ---------------------------
+    c0, c1, c2 = st.columns([1.0, 1.2, 1.2])
+    with c0:
+        mode = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True,
+                        help=("MTD: count an event only if the deal was also created in the window. "
+                              "Cohort: count by the event date regardless of create month."))
+    with c1:
+        scope = st.radio("Date scope (Create-date based window)", ["Today", "Yesterday", "This month", "Custom"],
+                         index=2, horizontal=True)
+    with c2:
+        gran = st.radio("Time granularity (x-axis)", ["Day", "Week", "Month", "Year"], index=0, horizontal=True)
+
+    today_d = date.today()
+    if scope == "Today":
+        range_start, range_end = today_d, today_d
+    elif scope == "Yesterday":
+        yd = today_d - timedelta(days=1)
+        range_start, range_end = yd, yd
+    elif scope == "This month":
+        range_start, range_end = month_bounds(today_d)
+    else:
+        d1, d2 = st.columns(2)
+        with d1:
+            range_start = st.date_input("Start (inclusive)", value=today_d.replace(day=1))
+        with d2:
+            range_end   = st.date_input("End (inclusive)", value=month_bounds(today_d)[1])
+        if range_end < range_start:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+    st.caption(f"Window: **{range_start} → {range_end}** • Mode: **{mode}** • Granularity: **{gran}**")
+
+    # Group-by & mapping (as before)
+    label_to_col = {
+        "None": None,
+        "Academic Counsellor": "Counsellor",
+        "Country": "Country",
+        "JetLearn Deal Source": "JetLearn Deal Source",
+    }
+    gp1, gp2, gp3 = st.columns([1.2, 1.2, 1.2])
+    with gp1:
+        group_by_label = st.selectbox("Group by (color/series)",
+                                      list(label_to_col.keys()), index=0)
+        group_by_col = label_to_col[group_by_label]
+    with gp2:
+        chart_type = st.selectbox("Chart type", ["Bar", "Line", "Area (stack)", "Bar + Line (overlay)"], index=3,
+                                  help="Bar + Line overlays the 1st metric as bars and 2nd metric as a line (only when Group by is None).")
+    with gp3:
+        stack_opt = st.checkbox("Stack series (for Bar/Area)", value=True)
+
+    METRIC_LABELS = [
+        "Deals Created",
+        "Enrolments",
+        "First Cal Scheduled — Count",
+        "Calibration Rescheduled — Count",
+        "Calibration Done — Count",
+        "Enrolments / Created %",
+        "Enrolments / Cal Done %",
+        "Cal Done / First Cal %",
+        "First Cal / Created %",
+    ]
+    default_metrics = ["Deals Created", "Enrolments"]
+    metrics_sel = st.multiselect("Metrics to plot", options=METRIC_LABELS,
+                                 default=default_metrics, help="Pick 1–4. For Bar+Line, pick up to 2 for best clarity.")
+
+    # Filters with "All"
+    def _norm_cat(s):
+        return s.fillna("Unknown").astype(str).str.strip()
+
+    f1, f2, f3 = st.columns([1.2, 1.2, 1.2])
+    if _cns:
+        cns_all = sorted(_norm_cat(df_f[_cns]).unique().tolist())
+        pick_cns = f1.multiselect("Filter Academic Counsellor", options=["All"] + cns_all, default=["All"])
+    else:
+        pick_cns = ["All"]
+    if _cty:
+        cty_all = sorted(_norm_cat(df_f[_cty]).unique().tolist())
+        pick_cty = f2.multiselect("Filter Country", options=["All"] + cty_all, default=["All"])
+    else:
+        pick_cty = ["All"]
+    if _src:
+        src_all = sorted(_norm_cat(df_f[_src]).unique().tolist())
+        pick_src = f3.multiselect("Filter JetLearn Deal Source", options=["All"] + src_all, default=["All"])
+    else:
+        pick_src = ["All"]
+
+    # ---------------------------
+    # Normalize base series
+    # ---------------------------
+    C = coerce_datetime(df_f[_create]).dt.date
+    P = coerce_datetime(df_f[_pay]).dt.date
+    F = coerce_datetime(df_f[_first]).dt.date if _first else None
+    R = coerce_datetime(df_f[_resch]).dt.date if _resch else None
+    D = coerce_datetime(df_f[_done]).dt.date  if _done  else None
+
+    CNS = _norm_cat(df_f[_cns]) if _cns else pd.Series("Unknown", index=df_f.index)
+    CTY = _norm_cat(df_f[_cty]) if _cty else pd.Series("Unknown", index=df_f.index)
+    SRC = _norm_cat(df_f[_src]) if _src else pd.Series("Unknown", index=df_f.index)
+
+    # Apply filters
+    def _apply_all(series, picks):
+        if (series is None) or ("All" in picks): return pd.Series(True, index=df_f.index)
+        return _norm_cat(series).isin(picks)
+
+    fmask = _apply_all(CNS, pick_cns) & _apply_all(CTY, pick_cty) & _apply_all(SRC, pick_src)
+
+    # Window mask by Create-date (denominator window)
+    def _between(s, a, b):
+        return s.notna() & (s >= a) & (s <= b)
+
+    m_created_win = _between(C, range_start, range_end)
+
+    # Event-in-window masks (by their “own” dates)
+    m_pay_win   = _between(P, range_start, range_end)
+    m_first_win = _between(F, range_start, range_end) if F is not None else pd.Series(False, index=df_f.index)
+    m_resc_win  = _between(R, range_start, range_end) if R is not None else pd.Series(False, index=df_f.index)
+    m_done_win  = _between(D, range_start, range_end) if D is not None else pd.Series(False, index=df_f.index)
+
+    # Mode logic for events
+    if mode == "MTD":
+        m_enrol_eff = m_pay_win   & m_created_win
+        m_first_eff = m_first_win & m_created_win
+        m_resc_eff  = m_resc_win  & m_created_win
+        m_done_eff  = m_done_win  & m_created_win
+    else:
+        m_enrol_eff = m_pay_win
+        m_first_eff = m_first_win
+        m_resc_eff  = m_resc_win
+        m_done_eff  = m_done_win
+
+    # Focused dataset
+    base = pd.DataFrame({
+        "_C": C, "_P": P,
+        "_F": F if F is not None else pd.Series(pd.NaT, index=df_f.index),
+        "_R": R if R is not None else pd.Series(pd.NaT, index=df_f.index),
+        "_D": D if D is not None else pd.Series(pd.NaT, index=df_f.index),
+        "Counsellor": CNS, "Country": CTY, "JetLearn Deal Source": SRC,
+    })
+    base = base.loc[fmask].copy()
+
+    # ---------------------------
+    # Pretty bucketing (Key + Label)
+    # ---------------------------
+    def _bucket_key_label(series_date):
+        s = pd.to_datetime(series_date, errors="coerce")
+        if gran == "Day":
+            key   = s.dt.date
+            label = (s.dt.strftime("%b ") + s.dt.day.astype(str))
+        elif gran == "Week":
+            per   = s.dt.to_period("W")
+            # sort by week start
+            key   = per.apply(lambda p: p.start_time.date() if pd.notna(p) else pd.NaT)
+            wkno  = s.dt.isocalendar().week.astype("Int64")
+            label = "Wk " + wkno.astype(str)
+        elif gran == "Month":
+            per   = s.dt.to_period("M")
+            key   = per.dt.to_timestamp().dt.date
+            label = per.strftime("%b")
+        else:
+            per   = s.dt.to_period("Y")
+            key   = per.dt.to_timestamp().dt.date
+            label = per.strftime("%Y")
+        return key, label
+
+    # ---------------------------
+    # Build per-event frames
+    # ---------------------------
+    def _frame(date_series, mask, name):
+        if mask is None or not mask.any():
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
+        df = base.loc[mask.loc[base.index]].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
+
+        bk, bl = _bucket_key_label(date_series.loc[df.index])
+        df["BucketKey"]   = bk
+        df["BucketLabel"] = bl
+
+        if group_by_col:
+            if group_by_col not in df.columns:
+                return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
+            g = (df.groupby(["BucketKey","BucketLabel", group_by_col], dropna=False)
+                   .size().rename("Count").reset_index())
+            g["Group"] = g[group_by_col].astype(str)
+        else:
+            g = (df.groupby(["BucketKey","BucketLabel"], dropna=False)
+                   .size().rename("Count").reset_index())
+            g["Group"] = "All"
+
+        g["Metric"] = name
+        return g[["BucketKey","BucketLabel","Group","Metric","Count"]]
+
+    created_df = _frame(base["_C"], m_created_win.loc[base.index], "Deals Created")
+    enrol_df   = _frame(base["_P"], m_enrol_eff.loc[base.index],  "Enrolments")
+    first_df   = _frame(base["_F"], m_first_eff.loc[base.index],  "First Cal Scheduled — Count")
+    resc_df    = _frame(base["_R"], m_resc_eff.loc[base.index],   "Calibration Rescheduled — Count")
+    done_df    = _frame(base["_D"], m_done_eff.loc[base.index],   "Calibration Done — Count")
+
+    # Merge to compute derived ratios per (Bucket, Group)
+    def _merge_counts(dfs):
+        if not dfs: 
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group"])
+        out = None
+        for dfi in dfs:
+            if dfi is None or dfi.empty: 
+                continue
+            piv = (dfi.pivot_table(index=["BucketKey","BucketLabel","Group"],
+                                   columns="Metric", values="Count", aggfunc="sum")
+                      .reset_index())
+            out = piv if out is None else out.merge(piv, on=["BucketKey","BucketLabel","Group"], how="outer")
+        if out is None:
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group"])
+        out = out.fillna(0)
+        # Ensure base columns exist
+        for col in ["Deals Created","Enrolments","Calibration Done — Count","First Cal Scheduled — Count","Calibration Rescheduled — Count"]:
+            if col not in out.columns: out[col] = 0
+        # Derived %
+        out["Enrolments / Created %"]  = np.where(out["Deals Created"] > 0, out["Enrolments"] / out["Deals Created"] * 100.0, np.nan)
+        out["Enrolments / Cal Done %"] = np.where(out["Calibration Done — Count"] > 0, out["Enrolments"] / out["Calibration Done — Count"] * 100.0, np.nan)
+        out["Cal Done / First Cal %"]  = np.where(out["First Cal Scheduled — Count"] > 0, out["Calibration Done — Count"] / out["First Cal Scheduled — Count"] * 100.0, np.nan)
+        out["First Cal / Created %"]   = np.where(out["Deals Created"] > 0, out["First Cal Scheduled — Count"] / out["Deals Created"] * 100.0, np.nan)
+        return out
+
+    wide = _merge_counts([created_df, enrol_df, first_df, resc_df, done_df])
+    if wide.empty:
+        st.info("No data in the selected window/filters.")
+        st.stop()
+
+    # Sort by BucketKey and build an ordered list of labels for the x-axis
+    wide = wide.sort_values("BucketKey")
+    ordered_labels = wide.drop_duplicates(["BucketKey","BucketLabel"])["BucketLabel"].tolist()
+
+    # Melt to long for charting
+    keep_cols = ["BucketKey","BucketLabel","Group"] + metrics_sel
+    for k in metrics_sel:
+        if k not in wide.columns:
+            wide[k] = np.nan
+    plot_df = wide[keep_cols].melt(id_vars=["BucketKey","BucketLabel","Group"], var_name="Metric", value_name="Value")
+
+    base_enc = alt.Chart(plot_df)
+
+    def _is_ratio(m): return m.endswith("%")
+
+    overlay_possible = (chart_type == "Bar + Line (overlay)") and (group_by_col is None) and (len(metrics_sel) >= 1)
+    if overlay_possible:
+        m1 = metrics_sel[0]
+        bars = (
+            base_enc.transform_filter(alt.datum.Metric == m1)
+            .mark_bar(opacity=0.85)
+            .encode(
+                x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
+                y=alt.Y("Value:Q", title=m1, axis=alt.Axis(format=".1f" if _is_ratio(m1) else "")),
+                tooltip=[alt.Tooltip("BucketLabel:N", title="Period"),
+                         alt.Tooltip("Metric:N"),
+                         alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m1) else "d")],
+                color=alt.value("#A8C5FD")
+            )
+        )
+        if len(metrics_sel) >= 2:
+            m2 = metrics_sel[1]
+            line = (
+                base_enc.transform_filter(alt.datum.Metric == m2)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
+                    y=alt.Y("Value:Q", title=m1, axis=alt.Axis(format=".1f" if _is_ratio(m1) else "")),
+                    color=alt.value("#333333"),
+                    tooltip=[alt.Tooltip("BucketLabel:N", title="Period"),
+                             alt.Tooltip("Metric:N"),
+                             alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m2) else "d")],
+                )
+            )
+            ch = bars + line
+            ttl = f"{m1} (bar) + {m2} (line)"
+        else:
+            ch = bars
+            ttl = f"{m1} (bar)"
+        st.altair_chart(ch.properties(height=360, title=ttl), use_container_width=True)
+
+    else:
+        color_field = "Metric:N" if group_by_col is None else "Group:N"
+        tooltip_common = [
+            alt.Tooltip("BucketLabel:N", title="Period"),
+            alt.Tooltip("Group:N", title=("Group" if group_by_col is None else group_by_label)),
+            alt.Tooltip("Metric:N"),
+        ]
+        if chart_type == "Line":
+            mark = base_enc.mark_line(point=True)
+        elif chart_type == "Area (stack)":
+            mark = base_enc.mark_area(opacity=0.85)
+        else:
+            mark = base_enc.mark_bar(opacity=0.85)
+
+        ch = mark.encode(
+            x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
+            y=alt.Y(
+                "Value:Q",
+                title="Value",
+                stack=("normalize" if (chart_type!="Line" and stack_opt and group_by_col is not None and all(not _is_ratio(m) for m in metrics_sel)) else None)
+            ),
+            color=alt.Color(color_field, legend=alt.Legend(orient="bottom")),
+            tooltip=tooltip_common + [alt.Tooltip("Value:Q", format=".1f")]
+        ).properties(height=360, title=f"{' / '.join(metrics_sel)}")
+        st.altair_chart(ch, use_container_width=True)
+
+    st.markdown("---")
+
+    # ---------------------------
+    # Table + download
+    # ---------------------------
+    show = wide.copy()
+    for k in ["Enrolments / Created %","Enrolments / Cal Done %","Cal Done / First Cal %","First Cal / Created %"]:
+        if k in show.columns: show[k] = show[k].round(1)
+    # Keep pretty label and drop key from display
+    out_cols = ["BucketLabel","Group"] + [c for c in show.columns if c not in {"BucketKey","BucketLabel","Group"}]
+    st.dataframe(show[out_cols].rename(columns={"BucketLabel":"Period"}), use_container_width=True)
+    st.download_button(
+        "Download CSV — Daily Business",
+        data=show[out_cols].rename(columns={"BucketLabel":"Period"}).to_csv(index=False).encode("utf-8"),
+        file_name="daily_business.csv",
+        mime="text/csv",
+        key="db_dl"
+    )
